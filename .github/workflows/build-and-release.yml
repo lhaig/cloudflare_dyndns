@@ -10,6 +10,11 @@ env:
   DOCKER_REPO: lhaig/cfddns
   GO_VERSION: '1.24'
 
+# Add permissions required for creating releases
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   build:
     name: Build Go Binaries
@@ -100,6 +105,9 @@ jobs:
     needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # Add permissions to this job specifically
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
