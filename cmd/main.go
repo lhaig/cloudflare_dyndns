@@ -20,7 +20,7 @@ func main() {
 
 	// Check required parameters
 	if *zoneID == "" || *apiToken == "" || *hostname == "" {
-		fmt.Println("missing-credentials")
+		fmt.Println(internal.StatusMissingCredentials)
 		fmt.Println("Error: zone-id, api-token, and hostname are required")
 		flag.Usage()
 		os.Exit(1)
@@ -30,7 +30,7 @@ func main() {
 	updater := internal.NewDNSUpdater(*zoneID, *apiToken, *hostname, *ipAddr, *enableIPv6)
 	result, err := updater.Run()
 	if err != nil {
-		fmt.Println("authentication-error")
+		fmt.Println(internal.StatusAuthError)
 		fmt.Println("Error:", err)
 		os.Exit(1)
 	}

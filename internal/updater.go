@@ -1,27 +1,26 @@
 package internal
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DNSUpdater implements Cloudflare DNS updating functionality
-type DNSUpdater struct {
-	ZoneID     string
-	APIToken   string
-	Hostname   string
-	IPAddr     string
-	EnableIPv6 bool
-	client     *http.Client
-}
+// Response status constants
+const (
+	StatusNoChange           = "no changes needed"
+	StatusGood               = "update successful"
+	StatusAuthError          = "authentication error"
+	StatusMissingCredentials = "missing credentials"
+
+	// Record types
+	RecordTypeA    = "A"
+	RecordTypeAAAA = "AAAA"
+
+	// Default timeout for operations
+	defaultTimeout = 30 * time.Second
+)
 
 // DNSRecord represents a Cloudflare DNS record
 type DNSRecord struct {
@@ -44,6 +43,17 @@ type CloudflareUpdateResponse struct {
 	Result  DNSRecord `json:"result"`
 }
 
+// DNSUpdater implements Cloudflare DNS updating functionality
+type DNSUpdater struct {
+	ZoneID     string
+	APIToken   string
+	Hostname   string
+	IPAddr     string
+	EnableIPv6 bool
+	cfClient   *CloudflareClient
+	ipDetector *IPDetector
+}
+
 // NewDNSUpdater creates a new DNS updater instance
 func NewDNSUpdater(zoneID, apiToken, hostname, ipAddr string, enableIPv6 bool) *DNSUpdater {
 	return &DNSUpdater{
@@ -52,360 +62,163 @@ func NewDNSUpdater(zoneID, apiToken, hostname, ipAddr string, enableIPv6 bool) *
 		Hostname:   hostname,
 		IPAddr:     ipAddr,
 		EnableIPv6: enableIPv6,
-		client:     &http.Client{},
+		cfClient:   NewCloudflareClient(zoneID, apiToken),
+		ipDetector: NewIPDetector(),
 	}
 }
 
 // Run executes the DNS update process
 func (u *DNSUpdater) Run() (string, error) {
-	var err error
-	var ipv4, ipv6 string
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
 
+	// Step 1: Detect or validate IP addresses
+	ipv4, ipv6, err := u.detectIPs(ctx)
+	if err != nil {
+		return StatusAuthError, fmt.Errorf("IP detection failed: %w", err)
+	}
+
+	// Step 2: Get existing DNS records
+	v4Record, err := u.getCurrentRecord(ctx, RecordTypeA)
+	if err != nil {
+		return StatusAuthError, err
+	}
+
+	var v6Record *DNSRecordInfo
+	if u.EnableIPv6 && ipv6 != "" {
+		v6Record, err = u.getCurrentRecord(ctx, RecordTypeAAAA)
+		if err != nil {
+			return StatusAuthError, err
+		}
+	}
+
+	// Step 3: Check if IP addresses have changed
+	if !u.needsUpdate(ipv4, ipv6, v4Record, v6Record) {
+		return StatusNoChange, nil
+	}
+
+	// Step 4: Update records as needed
+	updateResult, err := u.updateRecords(ctx, ipv4, ipv6, v4Record, v6Record)
+	if err != nil {
+		return StatusAuthError, err
+	}
+
+	return updateResult, nil
+}
+
+// detectIPs detects or validates IP addresses
+func (u *DNSUpdater) detectIPs(ctx context.Context) (ipv4, ipv6 string, err error) {
 	// If no IP address provided, detect it
 	if u.IPAddr == "" {
-		ipv4, err = u.detectIPv4()
+		ipv4, err = u.ipDetector.DetectIPv4(ctx)
 		if err != nil {
-			return "", err
+			return "", "", fmt.Errorf("detect IPv4: %w", err)
 		}
 	} else {
 		// Check if provided IP is IPv4 or IPv6
-		if isIPv4(u.IPAddr) {
+		if IsIPv4(u.IPAddr) {
 			ipv4 = u.IPAddr
-		} else if isIPv6(u.IPAddr) {
+		} else if IsIPv6(u.IPAddr) {
 			ipv6 = u.IPAddr
-			u.EnableIPv6 = false // Synology provided IPv6
+			u.EnableIPv6 = false // User provided IPv6 directly
 		} else {
-			return "", errors.New("invalid IP address provided")
+			return "", "", errors.New("invalid IP address provided")
 		}
 	}
 
 	// If IPv6 is enabled and we don't have an IPv6 yet, detect it
 	if u.EnableIPv6 && ipv6 == "" {
-		ipv6, err = u.detectIPv6()
-		if err == nil && ipv6 != "" {
-			// IPv6 successfully detected
-		} else {
-			u.EnableIPv6 = false // Disable IPv6 if not available
-		}
-	}
-
-	// Get current IPv4 record
-	var recordID, recordIP string
-	var recordProxied bool
-
-	if ipv4 != "" {
-		recordType := "A"
-		records, err := u.getRecords(recordType)
+		ipv6, err = u.ipDetector.DetectIPv6(ctx)
 		if err != nil {
-			return "", err
-		}
-
-		if len(records) > 0 {
-			recordID = records[0].ID
-			recordIP = records[0].Content
-			recordProxied = records[0].Proxied
+			// If we can't detect IPv6, just disable it rather than failing
+			u.EnableIPv6 = false
 		}
 	}
 
-	// Get current IPv6 record if enabled
-	var recordIDv6, recordIPv6 string
-	var recordProxiedv6 bool
+	return ipv4, ipv6, nil
+}
 
-	if u.EnableIPv6 && ipv6 != "" {
-		recordType := "AAAA"
-		records, err := u.getRecords(recordType)
-		if err != nil {
-			return "", err
-		}
+// DNSRecordInfo contains information about a DNS record
+type DNSRecordInfo struct {
+	ID      string
+	Content string
+	Proxied bool
+}
 
-		if len(records) > 0 {
-			recordIDv6 = records[0].ID
-			recordIPv6 = records[0].Content
-			recordProxiedv6 = records[0].Proxied
-		}
+// getCurrentRecord retrieves the current DNS record of specified type
+func (u *DNSUpdater) getCurrentRecord(ctx context.Context, recordType string) (*DNSRecordInfo, error) {
+	records, err := u.cfClient.GetDNSRecords(ctx, recordType, u.Hostname)
+	if err != nil {
+		return nil, fmt.Errorf("get %s records: %w", recordType, err)
 	}
 
-	// Check if IP addresses have changed
-	if (ipv4 != "" && recordIP == ipv4) &&
-		(ipv6 != "" && recordIPv6 == ipv6 || !u.EnableIPv6) {
-		return "no changes needed", nil
+	if len(records) == 0 {
+		return nil, nil // No record exists
 	}
 
-	// Update records as needed
-	var updateIPv4Success, updateIPv6Success bool
+	return &DNSRecordInfo{
+		ID:      records[0].ID,
+		Content: records[0].Content,
+		Proxied: records[0].Proxied,
+	}, nil
+}
 
-	// Update IPv4 if needed
-	if ipv4 != "" && (recordIP != ipv4 || recordID == "") {
-		recordType := "A"
+// needsUpdate determines if DNS records need to be updated
+func (u *DNSUpdater) needsUpdate(ipv4, ipv6 string, v4Record, v6Record *DNSRecordInfo) bool {
+	// For IPv4
+	if ipv4 != "" && (v4Record == nil || v4Record.Content != ipv4) {
+		return true
+	}
 
-		if recordID == "" {
-			// Create new record
-			success, err := u.createRecord(recordType, ipv4, true)
-			if err != nil {
-				return "", err
-			}
-			updateIPv4Success = success
-		} else {
-			// Update existing record
-			success, err := u.updateRecord(recordType, recordID, ipv4, recordProxied)
-			if err != nil {
-				return "", err
-			}
-			updateIPv4Success = success
-		}
+	// For IPv6
+	if u.EnableIPv6 && ipv6 != "" && (v6Record == nil || v6Record.Content != ipv6) {
+		return true
+	}
+
+	return false
+}
+
+// updateRecords updates the DNS records as needed
+func (u *DNSUpdater) updateRecords(ctx context.Context, ipv4, ipv6 string, v4Record, v6Record *DNSRecordInfo) (string, error) {
+	var v4Success, v6Success bool
+	var v4Err, v6Err error
+
+	// Update IPv4 record if needed
+	if ipv4 != "" && (v4Record == nil || v4Record.Content != ipv4) {
+		v4Success, v4Err = u.updateRecord(ctx, RecordTypeA, v4Record, ipv4)
 	} else {
-		updateIPv4Success = true
+		v4Success = true
 	}
 
-	// Update IPv6 if enabled and needed
-	if u.EnableIPv6 && ipv6 != "" && (recordIPv6 != ipv6 || recordIDv6 == "") {
-		recordType := "AAAA"
-
-		if recordIDv6 == "" {
-			// Create new record
-			success, err := u.createRecord(recordType, ipv6, true)
-			if err != nil {
-				return "", err
-			}
-			updateIPv6Success = success
-		} else {
-			// Update existing record
-			success, err := u.updateRecord(recordType, recordIDv6, ipv6, recordProxiedv6)
-			if err != nil {
-				return "", err
-			}
-			updateIPv6Success = success
-		}
+	// Update IPv6 record if enabled and needed
+	if u.EnableIPv6 && ipv6 != "" && (v6Record == nil || v6Record.Content != ipv6) {
+		v6Success, v6Err = u.updateRecord(ctx, RecordTypeAAAA, v6Record, ipv6)
 	} else if !u.EnableIPv6 {
-		updateIPv6Success = true
+		v6Success = true
 	}
 
-	// Return result
-	if updateIPv4Success || updateIPv6Success {
-		return "update successful", nil
+	// Handle errors
+	if !v4Success && v4Err != nil {
+		return StatusAuthError, fmt.Errorf("update IPv4 record: %w", v4Err)
 	}
 
-	return "authentication_failed", errors.New("failed to update DNS records due to authentication error")
+	if !v6Success && v6Err != nil {
+		return StatusAuthError, fmt.Errorf("update IPv6 record: %w", v6Err)
+	}
+
+	if v4Success || v6Success {
+		return StatusGood, nil
+	}
+
+	return StatusAuthError, errors.New("failed to update DNS records")
 }
 
-// getRecords retrieves DNS records from Cloudflare
-func (u *DNSUpdater) getRecords(recordType string) ([]DNSRecord, error) {
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=%s&name=%s",
-		u.ZoneID, recordType, u.Hostname)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
+// updateRecord updates or creates a single DNS record
+func (u *DNSUpdater) updateRecord(ctx context.Context, recordType string, record *DNSRecordInfo, ipContent string) (bool, error) {
+	if record == nil {
+		// Create new record
+		return u.cfClient.CreateDNSRecord(ctx, recordType, u.Hostname, ipContent, true)
 	}
-
-	req.Header.Set("Authorization", "Bearer "+u.APIToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var cfResp CloudflareResponse
-	err = json.Unmarshal(body, &cfResp)
-	if err != nil {
-		return nil, err
-	}
-
-	if !cfResp.Success {
-		return nil, errors.New("cloudflare API request failed")
-	}
-
-	return cfResp.Result, nil
-}
-
-// createRecord creates a new DNS record in Cloudflare
-func (u *DNSUpdater) createRecord(recordType, content string, proxied bool) (bool, error) {
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", u.ZoneID)
-
-	recordData := DNSRecord{
-		Type:    recordType,
-		Name:    u.Hostname,
-		Content: content,
-		Proxied: proxied,
-	}
-
-	jsonData, err := json.Marshal(recordData)
-	if err != nil {
-		return false, err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return false, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+u.APIToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-
-	var cfResp CloudflareUpdateResponse
-	err = json.Unmarshal(body, &cfResp)
-	if err != nil {
-		return false, err
-	}
-
-	return cfResp.Success, nil
-}
-
-// updateRecord updates an existing DNS record in Cloudflare
-func (u *DNSUpdater) updateRecord(recordType, recordID, content string, proxied bool) (bool, error) {
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", u.ZoneID, recordID)
-
-	recordData := DNSRecord{
-		Type:    recordType,
-		Name:    u.Hostname,
-		Content: content,
-		Proxied: proxied,
-	}
-
-	jsonData, err := json.Marshal(recordData)
-	if err != nil {
-		return false, err
-	}
-
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return false, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+u.APIToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-
-	var cfResp CloudflareUpdateResponse
-	err = json.Unmarshal(body, &cfResp)
-	if err != nil {
-		return false, err
-	}
-
-	return cfResp.Success, nil
-}
-
-// detectIPv4 detects the current public IPv4 address
-func (u *DNSUpdater) detectIPv4() (string, error) {
-	resp, err := http.Get("https://api.ipify.org")
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(ip), nil
-}
-
-// detectIPv6 detects the current public IPv6 address
-func (u *DNSUpdater) detectIPv6() (string, error) {
-	// First try to detect IPv6 using external services
-	// Try multiple services in case one is down
-	ipv6Services := []string{
-		"https://api6.ipify.org",
-		"https://v6.ident.me/",
-		"https://ipv6.icanhazip.com/",
-	}
-
-	for _, service := range ipv6Services {
-		// Try to get IPv6 address from external service
-		client := &http.Client{
-			Timeout: 5 * time.Second, // Add timeout for external services
-		}
-		resp, err := client.Get(service)
-		if err == nil {
-			defer resp.Body.Close()
-
-			ip, err := io.ReadAll(resp.Body)
-			if err == nil {
-				ipStr := strings.TrimSpace(string(ip))
-				if isIPv6(ipStr) {
-					return ipStr, nil
-				}
-			}
-		}
-	}
-
-	// Fallback to local network interfaces if external services failed
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", errors.New("failed to get IPv6 address: both external services and local interfaces failed")
-	}
-
-	for _, iface := range interfaces {
-		// Skip loopback, inactive interfaces, and wireless (which often have temporary IPv6)
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-
-			ip := ipNet.IP
-			// Skip IPv4 and link-local addresses
-			if ip.To4() != nil || ip.IsLinkLocalUnicast() {
-				continue
-			}
-
-			// Only use global unicast addresses
-			if ip.To16() != nil && ip.IsGlobalUnicast() {
-				return ip.String(), nil
-			}
-		}
-	}
-
-	return "", errors.New("no IPv6 address found from external services or local interfaces")
-}
-
-// isIPv4 checks if a string is an IPv4 address
-func isIPv4(ip string) bool {
-	regex := `^((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])$`
-	r := regexp.MustCompile(regex)
-	return r.MatchString(ip)
-}
-
-// isIPv6 checks if a string is an IPv6 address
-func isIPv6(ip string) bool {
-	parsedIP := net.ParseIP(ip)
-	return parsedIP != nil && parsedIP.To4() == nil
+	// Update existing record
+	return u.cfClient.UpdateDNSRecord(ctx, record.ID, recordType, u.Hostname, ipContent, record.Proxied)
 }
