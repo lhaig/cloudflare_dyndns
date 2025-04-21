@@ -1,6 +1,6 @@
 # Cloudflare DynDNS Updater (cfddns)
 
-A Golang application that updates Cloudflare DNS records with your current public IP address. This is a Go implementation of the bash script for updating Cloudflare DNS records.
+A Golang application that updates Cloudflare DNS records with your current public IP address.
 
 ## Features
 
@@ -9,6 +9,20 @@ A Golang application that updates Cloudflare DNS records with your current publi
 - Maintains existing proxy settings for each record
 - Containerized for easy deployment on any platform
 - Supports multiple architectures
+
+## Installation
+
+### Pre-built Binaries
+
+Pre-built binaries for various platforms are available on the [GitHub Releases page](https://github.com/lhaig/cloudflare_dyndns/releases).
+
+### Docker Image
+
+Pre-built multi-architecture Docker images are available on Docker Hub:
+
+```bash
+docker pull lhaig/cfddns:latest
+```
 
 ## Usage
 
@@ -49,16 +63,10 @@ go build -o cfddns ./cmd/main.go
 
 ### Docker Container
 
-Build the Docker image:
-
-```bash
-docker build -t cfddns .
-```
-
 Run the container:
 
 ```bash
-docker run --rm cfddns -zone-id YOUR_DNS_ZONE_ID -api-token YOUR_DNS_API_TOKEN -hostname example.com
+docker run --rm lhaig/cfddns:latest -zone-id YOUR_DNS_ZONE_ID -api-token YOUR_DNS_API_TOKEN -hostname example.com
 ```
 
 Or with environment variables:
@@ -68,22 +76,63 @@ docker run --rm \
   -e CLOUDFLARE_ZONE_ID=YOUR_ZONE_ID \
   -e CLOUDFLARE_API_TOKEN=YOUR_API_TOKEN \
   -e CLOUDFLARE_HOSTNAME=example.com \
-  cfddns
+  lhaig/cfddns:latest
 ```
 
-### Building Multi-architecture Images
+## Development
+
+### Building Locally
+
+Build the binary:
+
+```bash
+make build
+```
+
+Build the Docker image:
+
+```bash
+make docker
+```
+
+Run tests:
+
+```bash
+make test
+```
+
+### Building Multi-architecture Images Locally
 
 To build for multiple architectures using Docker BuildX:
 
 ```bash
-# Set up buildx builder instance
-docker buildx create --name mybuilder --use
-
-# Build and push the multi-architecture image
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
-  -t yourusername/cfddns:latest \
-  --push .
+make docker-buildx
 ```
+
+### CI/CD Pipeline
+
+This project uses GitHub Actions to automatically:
+
+1. Build binaries for multiple platforms (Linux, Windows, macOS) and architectures (amd64, arm64, arm/v7)
+2. Run tests to ensure code quality
+3. Create GitHub releases with pre-built binaries when a tag is pushed
+4. Build and push multi-architecture Docker images to Docker Hub
+
+The workflow is triggered on:
+- Pushes to the main branch
+- Pull requests to the main branch
+- Pushes of tags starting with 'v' (e.g., v1.0.0)
+
+#### Creating a Release
+
+To create a new release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This will trigger the GitHub Actions workflow, which will build the binaries, create a GitHub release, and publish Docker images tagged with the version number.
 
 ## Automation
 
@@ -106,7 +155,7 @@ job "cfddns" {
       driver = "docker"
 
       config {
-        image = "yourusername/cfddns:latest"
+        image = "lhaig/cfddns:latest"
       }
 
       env {
