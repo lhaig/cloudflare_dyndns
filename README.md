@@ -142,11 +142,14 @@ For automatic updates, you can run this container using a cron job or a schedule
 
 ```hcl
 job "cfddns" {
-  datacenters = ["dc1"]
+  datacenters = ["tpi-dc1"]
   type = "batch"
 
   periodic {
-    cron = "*/15 * * * *"  # Run every 15 minutes
+    crons = [
+        # Run at 6 AM and 6 PM daily
+        "0 6,18 * * *"
+    ]
     prohibit_overlap = true
   }
 
@@ -158,10 +161,16 @@ job "cfddns" {
         image = "lhaig/cfddns:latest"
       }
 
-      env {
-        CLOUDFLARE_ZONE_ID = "your-zone-id"
-        CLOUDFLARE_API_TOKEN = "your-api-token"
-        CLOUDFLARE_HOSTNAME = "your-hostname"
+      template {
+        destination = "${NOMAD_SECRETS_DIR}/cfdns.env"
+        env         = true
+        data = <<EOH
+{{ with nomadVar "nomad/jobs/cfddns" }}
+CLOUDFLARE_ZONE_ID={{ .zone_id }}
+CLOUDFLARE_API_TOKEN={{ .api_token }}
+CLOUDFLARE_HOSTNAME={{ .hostname }}
+{{ end }}
+EOH
       }
     }
   }
@@ -172,6 +181,7 @@ job "cfddns" {
 
 The application will print one of the following values:
 
-- `good`: The update was successful
-- `nochg`: The IP address has not changed
-- `badauth`: Authentication failed or another error occurred
+- `update successful`: The DNS record was successfully updated to a new IP address
+- `no changes needed`: The IP address has not changed since the last update
+- `authentication error`: Authentication failed or another error occurred
+- `missing credentials`: Required parameters (zone-id, api-token, hostname) were not provided
